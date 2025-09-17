@@ -177,13 +177,9 @@ async function forwardFundsDetailed(newBalance) {
     stage: 'start',
     lamportsBalance: newBalance,
     lamportsToSend: null,
-    timestamps: {},
     rpcLatency: {},
     signature: null,
-    error: null,
-    processedMs: null,
-    confirmedMs: null,
-    finalizedMs: null
+    error: null
   };
   const t0 = Date.now();
 
@@ -250,35 +246,9 @@ async function forwardFundsDetailed(newBalance) {
     });
     detail.stage = 'sent';
 
-    // قياسات بعد الإرسال - تتبع كل RPC call منفرد
-    const sig = detail.signature;
-    try {
-      const pStart = Date.now();
-      await primaryConnection.confirmTransaction(sig, 'processed');
-      detail.processedMs = Date.now() - pStart;
-      detail.rpcLatency.confirmProcessedMs = detail.processedMs;
-    } catch {}
-
-    try {
-      const cStart = Date.now();
-      await primaryConnection.confirmTransaction(sig, 'confirmed');
-      detail.confirmedMs = Date.now() - cStart;
-      detail.rpcLatency.confirmConfirmedMs = detail.confirmedMs;
-    } catch {}
-
-    try {
-      const fStart = Date.now();
-      await primaryConnection.confirmTransaction(sig, 'finalized');
-      detail.finalizedMs = Date.now() - fStart;
-      detail.rpcLatency.confirmFinalizedMs = detail.finalizedMs;
-    } catch {}
+    // إنهاء المعالجة بعد الإرسال الناجح (توفير موارد RPC)
 
     detail.totalDurationMs = Date.now() - t0;
-    
-    // حساب النسبة المئوية من الوقت المستخدم في RPC
-    const totalRpcTime = Object.values(detail.rpcLatency).reduce((sum, time) => sum + (time || 0), 0);
-    detail.rpcPercentage = Math.round((totalRpcTime / detail.totalDurationMs) * 100);
-    detail.localProcessingMs = detail.totalDurationMs - totalRpcTime;
     
     addSendDetail(detail);
 
@@ -292,27 +262,28 @@ async function forwardFundsDetailed(newBalance) {
 }
 
 // مراقبة الحساب
-let lastBalance = 0;
 let subscriptionId = null;
 
 async function startMonitor() {
   try {
-    lastBalance = await primaryConnection.getBalance(wallet.publicKey, 'processed');
-    addLog('info', `الرصيد الابتدائي: ${lastBalance / LAMPORTS_PER_SOL} SOL`);
-    if (lastBalance > 0) forwardFundsDetailed(lastBalance);
+    const initialBalance = await primaryConnection.getBalance(wallet.publicKey, 'processed');
+    addLog('info', `الرصيد الابتدائي: ${initialBalance / LAMPORTS_PER_SOL} SOL`);
+    if (initialBalance > 0) forwardFundsDetailed(initialBalance);
 
-    subscriptionId = primaryConnection.onAccountChange(
+    subscriptionId = primaryConnection.onLogs(
       wallet.publicKey,
-      (info) => {
-        const newBal = info.lamports;
-        if (newBal > 0 && newBal !== lastBalance) {
-          const diff = newBal - (lastBalance||0);
-          addLog('receive', `رصيد جديد ${newBal/LAMPORTS_PER_SOL} SOL (+${diff/LAMPORTS_PER_SOL} SOL)`);
-          forwardFundsDetailed(newBal);
+      async (log) => {
+        try {
+          const balance = await primaryConnection.getBalance(wallet.publicKey, 'processed');
+          if (balance > 0) {
+            addLog('receive', `💰 معاملة جديدة - ${log.signature} - الرصيد: ${balance/LAMPORTS_PER_SOL} SOL`);
+            forwardFundsDetailed(balance);
+          }
+        } catch (error) {
+          addLog('error', `خطأ في onLogs: ${error.message}`);
         }
-        lastBalance = newBal;
       },
-      'processed'
+      "processed"
     );
 
     addLog('info', `تم الاشتراك عبر ${connections[0].name} (id=${subscriptionId})`);
