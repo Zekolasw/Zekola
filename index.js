@@ -1,7 +1,8 @@
 // monitor-detailed.js
 require('dotenv').config();
 const express = require('express');
-const { Connection, Keypair, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } = require('@solana/web3.js');
+const https = require('https');
+const { Connection, Keypair, PublicKey, Transaction, SystemProgram, ComputeBudgetProgram, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const bs58 = require('bs58').default;
 const app = express();
 app.use(express.json());
@@ -42,6 +43,10 @@ function normalizeRpc(url) {
   return normalizedUrl;
 }
 
+// تفعيل HTTP keep-alive عالميًا قبل إنشاء RPC connections
+https.globalAgent.keepAlive = true;
+console.log('✅ تم تفعيل HTTP Keep-Alive عالميًا');
+
 // تطبيع جميع الروابط وإنشاء connections
 const normalizedRpcs = rpcUrls.map(normalizeRpc);
 const connections = normalizedRpcs.map(url => ({
@@ -54,8 +59,64 @@ const connections = normalizedRpcs.map(url => ({
 
 console.log(`🔗 تم إنشاء ${connections.length} اتصالات RPC`);
 
-// الاتصال الرئيسي (للمراقبة)
+// نظام تناوب الروابط (كل ساعة)
+let currentRpcIndex = 0;
+let lastRotationTime = Date.now();
+const ROTATION_INTERVAL = 60 * 60 * 1000; // ساعة واحدة
+
+// الاتصال الرئيسي (للمراقبة) - سيتم استخدامه للإشتراكات فقط
 const primaryConnection = connections[0].connection;
+
+// نظام cache للـ blockhash
+let cachedBlockhash = null;
+let blockhashTimestamp = 0;
+let isUpdatingBlockhash = false;
+
+// دالة للحصول على الاتصال الحالي المتناوب
+function getCurrentConnection() {
+  const now = Date.now();
+  
+  // تحقق من ضرورة التناوب
+  if (now - lastRotationTime >= ROTATION_INTERVAL) {
+    currentRpcIndex = (currentRpcIndex + 1) % connections.length;
+    lastRotationTime = now;
+    console.log(`🔄 تناوب إلى RPC جديد: ${connections[currentRpcIndex].name} (${connections[currentRpcIndex].url})`);
+  }
+  
+  return connections[currentRpcIndex].connection;
+}
+
+// جلب وتخزين blockhash جديد
+async function updateCachedBlockhash() {
+  if (isUpdatingBlockhash) return; // تجنب الطلبات المتوازية
+  
+  isUpdatingBlockhash = true;
+  try {
+    const currentConnection = getCurrentConnection();
+    const { blockhash } = await currentConnection.getLatestBlockhash('processed');
+    cachedBlockhash = blockhash;
+    blockhashTimestamp = Date.now();
+  } catch (err) {
+    console.error(`❌ خطأ في تحديث blockhash: ${err.message}`);
+  } finally {
+    isUpdatingBlockhash = false;
+  }
+}
+
+// الحصول على blockhash من cache أو جلب جديد
+async function getCachedBlockhash() {
+  const now = Date.now();
+  const age = now - blockhashTimestamp;
+  
+  // استخدام cached blockhash إذا كان أحدث من 800ms
+  if (cachedBlockhash && age < 800) {
+    return cachedBlockhash;
+  }
+  
+  // إذا كان قديمًا أو غير متوفر، جلب جديد
+  await updateCachedBlockhash();
+  return cachedBlockhash;
+}
 
 // تحميل المحفظة
 let wallet;
@@ -72,6 +133,7 @@ console.log('Wallet:', wallet.publicKey.toString());
 console.log('Target:', TARGET_ADDRESS.toString());
 console.log('Primary RPC:', normalizedRpcs[0]);
 console.log(`📡 عدد RPCs المفعلة: ${connections.length}`);
+console.log(`🔄 نظام التناوب: تغيير الرابط كل ساعة - الرابط الحالي: ${connections[currentRpcIndex].name}`);
 
 // السجلات
 const logs = [];
@@ -184,22 +246,36 @@ async function forwardFundsDetailed(newBalance) {
   const t0 = Date.now();
 
   try {
-    const feeReserve = 5000;
+    // حساب رسوم الأولوية مطابقة لمعاملة صديقك
+    const microLamports = 1; // نفس قيمة صديقك للحصول على 0.0₈1 SOL priority fee
+    const computeUnits = 1000; // حد آمن قريب من 450 المستهلك عند صديقك
+    const priorityFeeLamports = Math.ceil((computeUnits * microLamports) / 1_000_000);
+    const feeReserve = 5001; // نفس إجمالي الرسوم عند صديقك (0.000005001 SOL)
+    
     const amount = newBalance - feeReserve;
     if (amount <= 0) {
-      addLog('warning', 'الرصيد لا يغطي الرسوم', { balance: newBalance });
+      addLog('warning', 'الرصيد لا يغطي الرسوم', { balance: newBalance, feeReserve });
       detail.stage = 'insufficient';
       addSendDetail({ ...detail, totalDurationMs: Date.now()-t0 });
       return;
     }
     detail.lamportsToSend = amount;
 
-    // blockhash - استخدام الأسرع من الـ RPC الرئيسي
+    // blockhash - استخدام cached blockhash
     const bhStart = Date.now();
-    const { blockhash } = await primaryConnection.getLatestBlockhash('processed');
+    const blockhash = await getCachedBlockhash();
     detail.rpcLatency.getBlockhashMs = Date.now() - bhStart;
 
-    // بناء المعاملة محسن - تحضير الـ instruction مسبقاً 
+    // بناء المعاملة محسن - تحضير الـ instructions مسبقاً
+    // إضافة رسوم الأولوية بالطريقة الصحيحة
+    const computeUnitLimitIx = ComputeBudgetProgram.setComputeUnitLimit({
+      units: computeUnits,
+    });
+    
+    const computeUnitPriceIx = ComputeBudgetProgram.setComputeUnitPrice({
+      microLamports: microLamports,
+    });
+    
     const transferInstruction = SystemProgram.transfer({
       fromPubkey: wallet.publicKey,
       toPubkey: TARGET_ADDRESS,
@@ -210,7 +286,9 @@ async function forwardFundsDetailed(newBalance) {
     const tx = new Transaction({ 
       recentBlockhash: blockhash, 
       feePayer: wallet.publicKey 
-    }).add(transferInstruction);
+    }).add(computeUnitLimitIx)
+      .add(computeUnitPriceIx)
+      .add(transferInstruction);
     
     tx.sign(wallet);
     const raw = tx.serialize({ requireAllSignatures: false });
@@ -320,7 +398,15 @@ app.get('/api/logs', (req,res)=>res.json(logs));
 app.get('/api/send-details',(req,res)=>res.json(sendDetails.slice(0,parseInt(req.query.limit||'20'))));
 
 const PORT = process.env.PORT||5000;
-app.listen(PORT, ()=> console.log(`🌐 افتح http://localhost:${PORT}`));
+app.listen(PORT, '0.0.0.0', ()=> console.log(`🌐 افتح http://localhost:${PORT}`));
+
+// تهيئة blockhash cache فور بدء التطبيق
+(async function initializeBlockhashCache() {
+  await updateCachedBlockhash();
+  
+  // تحديث blockhash كل 400ms في الخلفية
+  setInterval(updateCachedBlockhash, 400);
+})();
 
 // بدء المراقبة
 startMonitor();
